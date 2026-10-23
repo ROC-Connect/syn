@@ -74,6 +74,9 @@
 %% includes
 -include("syn.hrl").
 
+%% timeout for rpc calls done during automerge
+-define(RPC_TIMEOUT_MS, 5000).
+
 %% ===================================================================
 %% API
 %% ===================================================================
@@ -253,6 +256,8 @@ force_cluster_sync() ->
 init([]) ->
     %% monitor nodes
     ok = net_kernel:monitor_nodes(true),
+    %% purge entries of nodes that left the cluster while we were down (nodedown may have been lost in a crash)
+    purge_group_entries_for_disconnected_nodes(),
     %% rebuild
     rebuild_monitors(),
     %% start multicast process
@@ -380,6 +385,8 @@ handle_info({nodeup, RemoteNode}, State) ->
 handle_info({nodedown, RemoteNode}, State) ->
     error_logger:warning_msg("Syn(~p): Node ~p has left the cluster, removing group entries on local~n", [node(), RemoteNode]),
     raw_purge_group_entries_for_node(RemoteNode),
+    %% also purge entries of other disconnected nodes
+    purge_group_entries_for_disconnected_nodes(),
     {noreply, State};
 
 handle_info(sync_from_full_cluster, State) ->
@@ -559,6 +566,8 @@ handle_process_down(GroupName, Pid, Meta, Reason, #state{
 
 -spec groups_automerge(RemoteNode :: node()) -> ok.
 groups_automerge(RemoteNode) ->
+    %% ensure that groups doesn't have entries of nodes that are not connected
+    purge_group_entries_for_disconnected_nodes(),
     global:trans({{?MODULE, auto_merge_groups}, self()},
         fun() ->
             error_logger:info_msg("Syn(~p): GROUPS AUTOMERGE ----> Initiating for remote node ~p~n", [node(), RemoteNode]),
@@ -576,11 +585,14 @@ groups_automerge(RemoteNode) ->
                     raw_purge_group_entries_for_node(RemoteNode),
                     %% add
                     lists:foreach(fun({GroupName, RemotePid, RemoteMeta}) ->
-                        case rpc:call(node(RemotePid), erlang, is_process_alive, [RemotePid]) of
+                        case safe_rpc_call(node(RemotePid), erlang, is_process_alive, [RemotePid]) of
                             true ->
                                 add_to_local_table(GroupName, RemotePid, RemoteMeta, undefined);
-                            _ ->
-                                ok = rpc:call(RemoteNode, syn_groups, remove_from_local_table, [GroupName, RemotePid])
+                            false ->
+                                safe_rpc_call(RemoteNode, syn_groups, remove_from_local_table, [GroupName, RemotePid]);
+                            {badrpc, _} ->
+                                %% unknown (node unreachable or slow), do not touch the remote table, next sync will retry
+                                ok
                         end
                     end, GroupTuples),
                     %% exit
@@ -594,6 +606,38 @@ do_sync_from_full_cluster() ->
     lists:foreach(fun(RemoteNode) ->
         groups_automerge(RemoteNode)
     end, nodes()).
+
+-spec purge_group_entries_for_disconnected_nodes() -> ok.
+purge_group_entries_for_disconnected_nodes() ->
+    ConnectedNodes = [node() | nodes()],
+    NodesByName = ets:select(syn_groups_by_name, [{{{'_', '_'}, '_', '_', '$1'}, [], ['$1']}]),
+    NodesByPid = ets:select(syn_groups_by_pid, [{{{'_', '_'}, '_', '_', '$1'}, [], ['$1']}]),
+    StaleNodes = lists:usort(NodesByName ++ NodesByPid) -- ConnectedNodes,
+    lists:foreach(fun(StaleNode) ->
+        error_logger:warning_msg(
+            "Syn(~p): Node ~p is not connected, removing its stale group entries on local~n",
+            [node(), StaleNode]
+        ),
+        raw_purge_group_entries_for_node(StaleNode)
+    end, StaleNodes).
+
+-spec safe_rpc_call(Node :: node(), Module :: module(), Function :: atom(), Args :: [any()]) -> any().
+safe_rpc_call(Node, Module, Function, Args) ->
+    %% do not connect to nodes that are not in the cluster, and bound the call
+    Result = case lists:member(Node, [node() | nodes()]) of
+        true -> rpc:call(Node, Module, Function, Args, ?RPC_TIMEOUT_MS);
+        false -> {badrpc, nodedown}
+    end,
+    case Result of
+        {badrpc, Reason} ->
+            error_logger:warning_msg(
+                "Syn(~p): RPC ~p:~p on node ~p failed with reason ~p, skipping~n",
+                [node(), Module, Function, Node, Reason]
+            );
+        _ ->
+            ok
+    end,
+    Result.
 
 -spec raw_purge_group_entries_for_node(Node :: atom()) -> ok.
 raw_purge_group_entries_for_node(Node) ->

@@ -54,6 +54,8 @@
     two_nodes_multicall/1,
     two_nodes_groups_full_cluster_sync_on_boot_node_added_later/1,
     two_nodes_groups_full_cluster_sync_on_boot_syn_started_later/1,
+    two_nodes_groups_restart_purges_entries_of_nodes_that_left/1,
+    two_nodes_groups_automerge_purges_entries_of_nodes_that_left/1,
     three_nodes_anti_entropy/1,
     three_nodes_anti_entropy_manual/1
 ]).
@@ -118,7 +120,9 @@ groups() ->
             two_nodes_local_publish,
             two_nodes_multicall,
             two_nodes_groups_full_cluster_sync_on_boot_node_added_later,
-            two_nodes_groups_full_cluster_sync_on_boot_syn_started_later
+            two_nodes_groups_full_cluster_sync_on_boot_syn_started_later,
+            two_nodes_groups_restart_purges_entries_of_nodes_that_left,
+            two_nodes_groups_automerge_purges_entries_of_nodes_that_left
         ]},
         {three_nodes_groups, [shuffle], [
             three_nodes_partial_netsplit_consistency,
@@ -886,6 +890,62 @@ two_nodes_groups_full_cluster_sync_on_boot_syn_started_later(Config) ->
     %% check
     [Pid] = syn:get_members(<<"group">>),
     [Pid] = rpc:call(SlaveNode, syn, get_members, [<<"group">>]).
+
+two_nodes_groups_restart_purges_entries_of_nodes_that_left(Config) ->
+    %% get slaves
+    SlaveNode = proplists:get_value(slave_node, Config),
+    %% get a pid on a node that is gone for good
+    DeadPid = syn_test_suite_helper:start_process_on_dead_node(syn_slave_dead),
+    DeadNode = node(DeadPid),
+    %% start syn on nodes
+    ok = syn:start(),
+    ok = rpc:call(SlaveNode, syn, start, []),
+    timer:sleep(1000),
+    %% join live processes
+    LocalPid = syn_test_suite_helper:start_process(),
+    RemotePid = syn_test_suite_helper:start_process(SlaveNode),
+    ok = syn:join(<<"group">>, LocalPid),
+    ok = syn:join(<<"group">>, RemotePid),
+    timer:sleep(500),
+    %% inject a stale entry (as left behind by a lost nodedown)
+    ok = syn_groups:add_to_local_table(<<"group">>, DeadPid, undefined, undefined),
+    3 = length(syn:get_members(<<"group">>)),
+    %% crash groups
+    exit(whereis(syn_groups), kill),
+    timer:sleep(500),
+    %% stale entry is gone, live entries are kept
+    [] = ets:match_object(syn_groups_by_name, {{'_', '_'}, '_', '_', DeadNode}),
+    [] = ets:match_object(syn_groups_by_pid, {{'_', '_'}, '_', '_', DeadNode}),
+    true = lists:sort([LocalPid, RemotePid]) =:= lists:sort(syn:get_members(<<"group">>)).
+
+two_nodes_groups_automerge_purges_entries_of_nodes_that_left(Config) ->
+    %% get slaves
+    SlaveNode = proplists:get_value(slave_node, Config),
+    %% get a pid on a node that is gone for good
+    DeadPid = syn_test_suite_helper:start_process_on_dead_node(syn_slave_dead),
+    DeadNode = node(DeadPid),
+    %% start syn on nodes
+    ok = syn:start(),
+    ok = rpc:call(SlaveNode, syn, start, []),
+    timer:sleep(1000),
+    GroupsPid = whereis(syn_groups),
+    %% join live processes
+    LocalPid = syn_test_suite_helper:start_process(),
+    RemotePid = syn_test_suite_helper:start_process(SlaveNode),
+    ok = syn:join(<<"group">>, LocalPid),
+    ok = syn:join(<<"group">>, RemotePid),
+    timer:sleep(500),
+    %% inject a stale entry (as left behind by a lost nodedown or pushed by a fan-out)
+    ok = syn_groups:add_to_local_table(<<"group">>, DeadPid, undefined, undefined),
+    3 = length(syn:get_members(<<"group">>)),
+    %% automerge
+    ok = syn:force_cluster_sync(groups),
+    timer:sleep(1000),
+    %% stale entry is gone, live entries are kept, groups did not crash
+    GroupsPid = whereis(syn_groups),
+    [] = ets:match_object(syn_groups_by_name, {{'_', '_'}, '_', '_', DeadNode}),
+    [] = ets:match_object(syn_groups_by_pid, {{'_', '_'}, '_', '_', DeadNode}),
+    true = lists:sort([LocalPid, RemotePid]) =:= lists:sort(syn:get_members(<<"group">>)).
 
 three_nodes_partial_netsplit_consistency(Config) ->
     GroupName = "my group",

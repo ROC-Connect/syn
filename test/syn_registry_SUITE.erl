@@ -53,7 +53,12 @@
     two_nodes_registration_race_condition_conflict_resolution_when_process_died/1,
     two_nodes_registry_full_cluster_sync_on_boot_node_added_later/1,
     two_nodes_registry_full_cluster_sync_on_boot_syn_started_later/1,
-    two_nodes_unregister_and_register/1
+    two_nodes_unregister_and_register/1,
+    two_nodes_registration_conflict_with_pid_on_node_that_left/1,
+    two_nodes_registry_restart_purges_entries_of_nodes_that_left/1,
+    two_nodes_registration_conflict_with_both_pids_dead/1,
+    two_nodes_register_name_held_by_pid_on_node_that_left/1,
+    two_nodes_automerge_conflict_with_pid_on_node_that_left/1
 ]).
 -export([
     three_nodes_partial_netsplit_consistency/1,
@@ -131,7 +136,12 @@ groups() ->
             two_nodes_registration_race_condition_conflict_resolution_when_process_died,
             two_nodes_registry_full_cluster_sync_on_boot_node_added_later,
             two_nodes_registry_full_cluster_sync_on_boot_syn_started_later,
-            two_nodes_unregister_and_register
+            two_nodes_unregister_and_register,
+            two_nodes_registration_conflict_with_pid_on_node_that_left,
+            two_nodes_registry_restart_purges_entries_of_nodes_that_left,
+            two_nodes_registration_conflict_with_both_pids_dead,
+            two_nodes_register_name_held_by_pid_on_node_that_left,
+            two_nodes_automerge_conflict_with_pid_on_node_that_left
         ]},
         {three_nodes_process_registration, [shuffle], [
             three_nodes_partial_netsplit_consistency,
@@ -686,6 +696,155 @@ two_nodes_registry_full_cluster_sync_on_boot_syn_started_later(Config) ->
     %% check
     Pid = syn:whereis(<<"proc">>),
     Pid = rpc:call(SlaveNode, syn, whereis, [<<"proc">>]).
+
+two_nodes_registration_conflict_with_pid_on_node_that_left(Config) ->
+    ConflictingName = "COMMON",
+    %% get slaves
+    SlaveNode = proplists:get_value(slave_node, Config),
+    %% get a pid on a node that is gone for good
+    DeadPid = syn_test_suite_helper:start_process_on_dead_node(syn_slave_dead),
+    %% start syn on nodes
+    ok = syn:start(),
+    ok = rpc:call(SlaveNode, syn, start, []),
+    timer:sleep(1000),
+    RegistryPid = whereis(syn_registry),
+    %% inject a stale entry (as left behind by a lost nodedown) with a more recent time than the upcoming registration
+    ok = syn_registry:add_to_local_table(ConflictingName, DeadPid, dead_meta, erlang:system_time() + 1000000000, undefined),
+    {DeadPid, dead_meta} = syn:whereis(ConflictingName, with_meta),
+    %% register on slave node to trigger conflict resolution on master node
+    Pid1 = syn_test_suite_helper:start_process(SlaveNode),
+    ok = rpc:call(SlaveNode, syn, register, [ConflictingName, Pid1, SlaveNode]),
+    timer:sleep(1000),
+    %% registry did not crash
+    RegistryPid = whereis(syn_registry),
+    %% live pid wins on all nodes
+    {Pid1, SlaveNode} = syn:whereis(ConflictingName, with_meta),
+    {Pid1, SlaveNode} = rpc:call(SlaveNode, syn, whereis, [ConflictingName, with_meta]),
+    true = rpc:call(SlaveNode, erlang, is_process_alive, [Pid1]),
+    %% registry still works
+    LocalPid = syn_test_suite_helper:start_process(),
+    ok = syn:register(<<"after conflict">>, LocalPid),
+    LocalPid = syn:whereis(<<"after conflict">>),
+    RegistryPid = whereis(syn_registry).
+
+two_nodes_registry_restart_purges_entries_of_nodes_that_left(Config) ->
+    %% get slaves
+    SlaveNode = proplists:get_value(slave_node, Config),
+    %% get a pid on a node that is gone for good
+    DeadPid = syn_test_suite_helper:start_process_on_dead_node(syn_slave_dead),
+    %% start syn on nodes
+    ok = syn:start(),
+    ok = rpc:call(SlaveNode, syn, start, []),
+    timer:sleep(1000),
+    %% register live processes
+    LocalPid = syn_test_suite_helper:start_process(),
+    RemotePid = syn_test_suite_helper:start_process(SlaveNode),
+    ok = syn:register(<<"local proc">>, LocalPid),
+    ok = syn:register(<<"remote proc">>, RemotePid),
+    timer:sleep(500),
+    %% inject a stale entry (as left behind by a lost nodedown)
+    ok = syn_registry:add_to_local_table(<<"dead proc">>, DeadPid, undefined, erlang:system_time(), undefined),
+    DeadPid = syn:whereis(<<"dead proc">>),
+    %% crash registry
+    exit(whereis(syn_registry), kill),
+    timer:sleep(500),
+    %% stale entry is gone, live entries are kept
+    undefined = syn:whereis(<<"dead proc">>),
+    0 = syn:registry_count(node(DeadPid)),
+    LocalPid = syn:whereis(<<"local proc">>),
+    RemotePid = syn:whereis(<<"remote proc">>),
+    %% local process is monitored again
+    syn_test_suite_helper:kill_process(LocalPid),
+    timer:sleep(200),
+    undefined = syn:whereis(<<"local proc">>).
+
+two_nodes_registration_conflict_with_both_pids_dead(Config) ->
+    ConflictingName = "COMMON",
+    %% get slaves
+    SlaveNode = proplists:get_value(slave_node, Config),
+    %% get a pid on a node that is gone for good
+    DeadPid = syn_test_suite_helper:start_process_on_dead_node(syn_slave_dead),
+    %% start syn on nodes
+    ok = syn:start(),
+    ok = rpc:call(SlaveNode, syn, start, []),
+    timer:sleep(1000),
+    RegistryPid = whereis(syn_registry),
+    %% dead pid on slave node
+    DeadSlavePid = syn_test_suite_helper:start_process(SlaveNode),
+    syn_test_suite_helper:kill_process(DeadSlavePid),
+    timer:sleep(100),
+    %% inject stale entries on both nodes
+    ok = syn_registry:add_to_local_table(ConflictingName, DeadPid, dead_meta, erlang:system_time(), undefined),
+    ok = rpc:call(SlaveNode, syn_registry, add_to_local_table, [ConflictingName, DeadSlavePid, slave_meta, erlang:system_time(), undefined]),
+    %% simulate the sync of the slave's registration to trigger conflict resolution on master node
+    gen_server:cast(syn_registry, {sync_register, ConflictingName, DeadSlavePid, slave_meta, erlang:system_time(), false}),
+    timer:sleep(500),
+    %% registry did not crash
+    RegistryPid = whereis(syn_registry),
+    %% both entries are removed on all nodes
+    undefined = syn:whereis(ConflictingName),
+    undefined = rpc:call(SlaveNode, syn, whereis, [ConflictingName]),
+    0 = syn:registry_count(),
+    0 = rpc:call(SlaveNode, syn, registry_count, []).
+
+two_nodes_register_name_held_by_pid_on_node_that_left(Config) ->
+    Name = <<"my proc">>,
+    %% get slaves
+    SlaveNode = proplists:get_value(slave_node, Config),
+    %% get a pid on a node that is gone for good
+    DeadPid = syn_test_suite_helper:start_process_on_dead_node(syn_slave_dead),
+    %% start syn on nodes
+    ok = syn:start(),
+    ok = rpc:call(SlaveNode, syn, start, []),
+    timer:sleep(1000),
+    RegistryPid = whereis(syn_registry),
+    %% inject a stale entry (as left behind by a lost nodedown)
+    ok = syn_registry:add_to_local_table(Name, DeadPid, undefined, erlang:system_time(), undefined),
+    DeadPid = syn:whereis(Name),
+    %% name is free, register
+    LocalPid = syn_test_suite_helper:start_process(),
+    ok = syn:register(Name, LocalPid, local_meta),
+    timer:sleep(500),
+    %% registered on all nodes
+    RegistryPid = whereis(syn_registry),
+    {LocalPid, local_meta} = syn:whereis(Name, with_meta),
+    {LocalPid, local_meta} = rpc:call(SlaveNode, syn, whereis, [Name, with_meta]),
+    1 = syn:registry_count(),
+    %% local process is monitored
+    syn_test_suite_helper:kill_process(LocalPid),
+    timer:sleep(200),
+    undefined = syn:whereis(Name),
+    undefined = rpc:call(SlaveNode, syn, whereis, [Name]).
+
+two_nodes_automerge_conflict_with_pid_on_node_that_left(Config) ->
+    ConflictingName = "COMMON",
+    %% get slaves
+    SlaveNode = proplists:get_value(slave_node, Config),
+    %% get a pid on a node that is gone for good
+    DeadPid = syn_test_suite_helper:start_process_on_dead_node(syn_slave_dead),
+    %% start syn on nodes
+    ok = syn:start(),
+    ok = rpc:call(SlaveNode, syn, start, []),
+    timer:sleep(1000),
+    RegistryPid = whereis(syn_registry),
+    %% register live process on slave
+    Pid1 = syn_test_suite_helper:start_process(SlaveNode),
+    ok = rpc:call(SlaveNode, syn, register, [ConflictingName, Pid1, SlaveNode]),
+    timer:sleep(500),
+    {Pid1, SlaveNode} = syn:whereis(ConflictingName, with_meta),
+    %% overwrite with a stale entry on master (as left behind by a lost nodedown), more recent than the live one
+    ok = syn_registry:add_to_local_table(ConflictingName, DeadPid, dead_meta, erlang:system_time() + 1000000000, undefined),
+    {DeadPid, dead_meta} = syn:whereis(ConflictingName, with_meta),
+    %% automerge
+    ok = syn:force_cluster_sync(registry),
+    timer:sleep(1000),
+    %% registry did not crash
+    RegistryPid = whereis(syn_registry),
+    %% live pid wins on all nodes
+    {Pid1, SlaveNode} = syn:whereis(ConflictingName, with_meta),
+    {Pid1, SlaveNode} = rpc:call(SlaveNode, syn, whereis, [ConflictingName, with_meta]),
+    true = rpc:call(SlaveNode, erlang, is_process_alive, [Pid1]),
+    0 = syn:registry_count(node(DeadPid)).
 
 two_nodes_unregister_and_register(Config) ->
     Name = "common name",

@@ -59,6 +59,9 @@
 %% includes
 -include("syn.hrl").
 
+%% timeout for rpc calls done during conflict resolution
+-define(RPC_TIMEOUT_MS, 5000).
+
 %% ===================================================================
 %% API
 %% ===================================================================
@@ -142,12 +145,23 @@ sync_unregister(RemoteNode, Name, Pid) ->
     Name :: any(),
     Pid :: pid(),
     Meta :: any(),
-    MonitorRef :: reference(),
+    MonitorRef :: reference() | undefined | {badrpc, any()},
     Kill :: boolean()
 ) -> ok.
-sync_demonitor_and_kill_on_node(Name, Pid, Meta, MonitorRef, Kill) ->
+sync_demonitor_and_kill_on_node(Name, Pid, Meta, MonitorRef0, Kill) ->
     RemoteNode = node(Pid),
-    gen_server:cast({?MODULE, RemoteNode}, {sync_demonitor_and_kill_on_node, Name, Pid, Meta, MonitorRef, Kill}).
+    %% a failed lookup (e.g. {badrpc, timeout}) leaves nothing to demonitor
+    MonitorRef = case is_reference(MonitorRef0) of
+        true -> MonitorRef0;
+        false -> undefined
+    end,
+    case is_node_connected(RemoteNode) of
+        true ->
+            gen_server:cast({?MODULE, RemoteNode}, {sync_demonitor_and_kill_on_node, Name, Pid, Meta, MonitorRef, Kill});
+        false ->
+            %% node left the cluster, nothing to demonitor or kill there
+            ok
+    end.
 
 -spec sync_get_local_registry_tuples(FromNode :: node()) -> [syn_registry_tuple()].
 sync_get_local_registry_tuples(FromNode) ->
@@ -175,6 +189,8 @@ force_cluster_sync() ->
 init([]) ->
     %% monitor nodes
     ok = net_kernel:monitor_nodes(true),
+    %% purge entries of nodes that left the cluster while we were down (nodedown may have been lost in a crash)
+    purge_registry_entries_for_disconnected_nodes(),
     %% rebuild monitors (if coming after a crash)
     rebuild_monitors(),
     %% start multicast process
@@ -232,18 +248,34 @@ handle_call({register_on_node, Name, Pid, Meta, Force}, _From, State) ->
 
                 {Name, TablePid, _, _} ->
                     %% same name, different pid
-                    case Force of
-                        true ->
-                            demonitor_if_local(TablePid),
-                            %% force register
+                    case is_node_connected(node(TablePid)) of
+                        false ->
+                            %% stale entry of a node that left the cluster, name is free
+                            error_logger:warning_msg(
+                                "Syn(~p): Name ~p is registered to ~p on disconnected node ~p, removing stale entry~n",
+                                [node(), Name, TablePid, node(TablePid)]
+                            ),
+                            remove_from_local_table(Name, TablePid),
                             {ok, Time} = register_on_node(Name, Pid, Meta),
                             %% multicast
-                            multicast_register(Name, Pid, Meta, Time, true, State),
+                            multicast_register(Name, Pid, Meta, Time, false, State),
                             %% return
                             {reply, ok, State};
 
-                        _ ->
-                            {reply, {error, taken}, State}
+                        true ->
+                            case Force of
+                                true ->
+                                    demonitor_if_local(TablePid),
+                                    %% force register
+                                    {ok, Time} = register_on_node(Name, Pid, Meta),
+                                    %% multicast
+                                    multicast_register(Name, Pid, Meta, Time, true, State),
+                                    %% return
+                                    {reply, ok, State};
+
+                                _ ->
+                                    {reply, {error, taken}, State}
+                            end
                     end
             end;
         _ ->
@@ -302,12 +334,12 @@ handle_cast({sync_register, Name, RemotePid, RemoteMeta, RemoteTime, Force}, Sta
                         {TablePid, KillOtherPid} ->
                             %% keep table
                             %% demonitor
-                            MonitorRef = rpc:call(node(RemotePid), syn_registry, find_monitor_for_pid, [RemotePid]),
+                            MonitorRef = safe_rpc_call(node(RemotePid), syn_registry, find_monitor_for_pid, [RemotePid]),
                             sync_demonitor_and_kill_on_node(Name, RemotePid, RemoteMeta, MonitorRef, KillOtherPid),
                             %% overwrite local data to all remote nodes, except TablePid's node
                             NodesExceptLocalAndTablePidNode = nodes() -- [node(TablePid)],
                             lists:foreach(fun(RNode) ->
-                                ok = rpc:call(RNode,
+                                safe_rpc_call(RNode,
                                     syn_registry, add_to_local_table,
                                     [Name, TablePid, TableMeta, TableTime, undefined]
                                 )
@@ -316,12 +348,12 @@ handle_cast({sync_register, Name, RemotePid, RemoteMeta, RemoteTime, Force}, Sta
                         {RemotePid, KillOtherPid} ->
                             %% keep remote
                             %% demonitor
-                            MonitorRef = rpc:call(node(TablePid), syn_registry, find_monitor_for_pid, [TablePid]),
+                            MonitorRef = safe_rpc_call(node(TablePid), syn_registry, find_monitor_for_pid, [TablePid]),
                             sync_demonitor_and_kill_on_node(Name, TablePid, TableMeta, MonitorRef, KillOtherPid),
                             %% overwrite remote data to all other nodes (including local), except RemotePid's node
                             NodesExceptRemoteNode = [node() | nodes()] -- [node(RemotePid)],
                             lists:foreach(fun(RNode) ->
-                                ok = rpc:call(RNode,
+                                safe_rpc_call(RNode,
                                     syn_registry, add_to_local_table,
                                     [Name, RemotePid, RemoteMeta, RemoteTime, undefined]
                                 )
@@ -331,7 +363,8 @@ handle_cast({sync_register, Name, RemotePid, RemoteMeta, RemoteTime, Force}, Sta
                             AllNodes = [node() | nodes()],
                             %% both are dead, remove from all nodes
                             lists:foreach(fun(RNode) ->
-                                ok = rpc:call(RNode, syn_registry, remove_from_local_table, [Name, RemotePid])
+                                safe_rpc_call(RNode, syn_registry, remove_from_local_table, [Name, RemotePid]),
+                                safe_rpc_call(RNode, syn_registry, remove_from_local_table, [Name, TablePid])
                             end, AllNodes)
                     end,
 
@@ -410,6 +443,8 @@ handle_info({nodeup, RemoteNode}, State) ->
 handle_info({nodedown, RemoteNode}, State) ->
     error_logger:warning_msg("Syn(~p): Node ~p has left the cluster, removing registry entries on local~n", [node(), RemoteNode]),
     raw_purge_registry_entries_for_remote_node(RemoteNode),
+    %% also purge entries of other disconnected nodes (e.g. pushed by a conflict fan-out from a node we were never connected to)
+    purge_registry_entries_for_disconnected_nodes(),
     {noreply, State};
 
 handle_info(sync_from_full_cluster, State) ->
@@ -643,6 +678,8 @@ handle_process_down(Name, Pid, Meta, Reason, #state{
 
 -spec registry_automerge(RemoteNode :: node(), #state{}) -> ok.
 registry_automerge(RemoteNode, State) ->
+    %% ensure that registry doesn't have entries of nodes that are not connected
+    purge_registry_entries_for_disconnected_nodes(),
     global:trans({{?MODULE, auto_merge_registry}, self()},
         fun() ->
             error_logger:info_msg("Syn(~p): REGISTRY AUTOMERGE ----> Initiating for remote node ~p~n", [node(), RemoteNode]),
@@ -697,15 +734,15 @@ resolve_tuple_in_automerge(Name, RemotePid, RemoteMeta, RemoteTime, State) ->
                 {TablePid, KillOtherPid} ->
                     %% keep local
                     %% demonitor
-                    MonitorRef = rpc:call(node(RemotePid), syn_registry, find_monitor_for_pid, [RemotePid]),
+                    MonitorRef = safe_rpc_call(node(RemotePid), syn_registry, find_monitor_for_pid, [RemotePid]),
                     sync_demonitor_and_kill_on_node(Name, RemotePid, RemoteMeta, MonitorRef, KillOtherPid),
                     %% remote data still on remote node, remove there
-                    ok = rpc:call(node(RemotePid), syn_registry, remove_from_local_table, [Name, RemotePid]);
+                    safe_rpc_call(node(RemotePid), syn_registry, remove_from_local_table, [Name, RemotePid]);
 
                 {RemotePid, KillOtherPid} ->
                     %% keep remote
                     %% demonitor
-                    MonitorRef = rpc:call(node(TablePid), syn_registry, find_monitor_for_pid, [TablePid]),
+                    MonitorRef = safe_rpc_call(node(TablePid), syn_registry, find_monitor_for_pid, [TablePid]),
                     sync_demonitor_and_kill_on_node(Name, TablePid, TableMeta, MonitorRef, KillOtherPid),
                     %% overwrite remote data to local
                     add_to_local_table(Name, RemotePid, RemoteMeta, RemoteTime, undefined);
@@ -713,7 +750,7 @@ resolve_tuple_in_automerge(Name, RemotePid, RemoteMeta, RemoteTime, State) ->
                 undefined ->
                     %% both are dead, remove from local & remote
                     remove_from_local_table(Name, TablePid),
-                    ok = rpc:call(node(RemotePid), syn_registry, remove_from_local_table, [Name, RemotePid])
+                    safe_rpc_call(node(RemotePid), syn_registry, remove_from_local_table, [Name, RemotePid])
             end
     end.
 
@@ -729,8 +766,9 @@ resolve_conflict(
     {RemotePid, RemoteMeta, RemoteTime},
     #state{custom_event_handler = CustomEventHandler}
 ) ->
-    TablePidAlive = rpc:call(node(TablePid), erlang, is_process_alive, [TablePid]),
-    RemotePidAlive = rpc:call(node(RemotePid), erlang, is_process_alive, [RemotePid]),
+    %% anything but 'true' (e.g. {badrpc, nodedown | timeout} for a pid on a node that left the cluster) means dead
+    TablePidAlive = safe_rpc_call(node(TablePid), erlang, is_process_alive, [TablePid]) =:= true,
+    RemotePidAlive = safe_rpc_call(node(RemotePid), erlang, is_process_alive, [RemotePid]) =:= true,
 
     %% check if pids are alive (race conditions if pid dies during resolution)
     {PidToKeep, KillOtherPid} = case {TablePidAlive, RemotePidAlive} of
@@ -803,6 +841,43 @@ raw_purge_registry_entries_for_remote_node(Node) when Node =/= node() ->
     ok;
 raw_purge_registry_entries_for_remote_node(_Node) ->
     ok.
+
+-spec purge_registry_entries_for_disconnected_nodes() -> ok.
+purge_registry_entries_for_disconnected_nodes() ->
+    ConnectedNodes = [node() | nodes()],
+    NodesByName = ets:select(syn_registry_by_name, [{{{'_', '_'}, '_', '_', '_', '$1'}, [], ['$1']}]),
+    NodesByPid = ets:select(syn_registry_by_pid, [{{{'_', '_'}, '_', '_', '_', '$1'}, [], ['$1']}]),
+    StaleNodes = lists:usort(NodesByName ++ NodesByPid) -- ConnectedNodes,
+    lists:foreach(fun(StaleNode) ->
+        error_logger:warning_msg(
+            "Syn(~p): Node ~p is not connected, removing its stale registry entries on local~n",
+            [node(), StaleNode]
+        ),
+        raw_purge_registry_entries_for_remote_node(StaleNode)
+    end, StaleNodes).
+
+-spec is_node_connected(Node :: node()) -> boolean().
+is_node_connected(Node) ->
+    lists:member(Node, [node() | nodes()]).
+
+-spec safe_rpc_call(Node :: node(), Module :: module(), Function :: atom(), Args :: [any()]) -> any().
+safe_rpc_call(Node, Module, Function, Args) ->
+    %% do not connect to nodes that are not in the cluster (a node that left would block on connection setup),
+    %% and bound the call (a node that is gone but not yet detected by net_ticktime would block until it is)
+    Result = case is_node_connected(Node) of
+        true -> rpc:call(Node, Module, Function, Args, ?RPC_TIMEOUT_MS);
+        false -> {badrpc, nodedown}
+    end,
+    case Result of
+        {badrpc, Reason} ->
+            error_logger:warning_msg(
+                "Syn(~p): RPC ~p:~p on node ~p failed with reason ~p, skipping~n",
+                [node(), Module, Function, Node, Reason]
+            );
+        _ ->
+            ok
+    end,
+    Result.
 
 -spec rebuild_monitors() -> ok.
 rebuild_monitors() ->

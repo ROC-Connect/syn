@@ -53,14 +53,14 @@ If you're using [rebar3](https://github.com/erlang/rebar3), add `syn` as a depen
 
 ```erlang
 {deps, [
-  {syn, {git, "git://github.com/ostinelli/syn.git", {tag, "2.1.1"}}}
+  {syn, {git, "git://github.com/ostinelli/syn.git", {tag, "2.1.4"}}}
 ]}.
 ```
 Or, if you're using [Hex.pm](https://hex.pm/) as package manager (with the [rebar3_hex](https://github.com/hexpm/rebar3_hex) plugin):
 
 ```erlang
 {deps, [
-  {syn, "2.1.1"}
+  {syn, "2.1.4"}
 ]}.
 ```
 
@@ -251,6 +251,15 @@ syn:member(Pid, GroupName) -> boolean().
 
 Types:
     Pid = pid()
+    GroupName = any()
+```
+
+To get a list of the existing groups:
+
+```erlang
+syn:get_group_names() -> [GroupName].
+
+Types:
     GroupName = any()
 ```
 
@@ -512,9 +521,10 @@ In `config.exs` you can specify your anti-entropy settings:
 
 ```elixir
 config :syn,
-  anti_entropy:
-    registry: [interval: 300, interval_max_deviation: 60]
+  anti_entropy: [
+    registry: [interval: 300, interval_max_deviation: 60],
     groups: [interval: 300, interval_max_deviation: 60]
+  ]
 ```
 
 #### Erlang

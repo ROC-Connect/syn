@@ -35,6 +35,7 @@
 -export([join/2, join/3]).
 -export([leave/2]).
 -export([get_members/1, get_members/2]).
+-export([get_group_names/0]).
 -export([member/2]).
 -export([get_local_members/1, get_local_members/2]).
 -export([local_member/2]).
@@ -163,9 +164,13 @@ get_members(GroupName) ->
 get_members(GroupName, with_meta) ->
     syn_groups:get_members(GroupName, with_meta).
 
--spec member(GroupName :: any(), Pid :: pid()) -> boolean().
-member(GroupName, Pid) ->
-    syn_groups:member(GroupName, Pid).
+-spec get_group_names() -> [GroupName :: any()].
+get_group_names() ->
+    syn_groups:get_group_names().
+
+-spec member(Pid :: pid(), GroupName :: any()) -> boolean().
+member(Pid, GroupName) ->
+    syn_groups:member(Pid, GroupName).
 
 -spec get_local_members(GroupName :: any()) -> [pid()].
 get_local_members(GroupName) ->
@@ -175,9 +180,9 @@ get_local_members(GroupName) ->
 get_local_members(GroupName, with_meta) ->
     syn_groups:get_local_members(GroupName, with_meta).
 
--spec local_member(GroupName :: any(), Pid :: pid()) -> boolean().
-local_member(GroupName, Pid) ->
-    syn_groups:local_member(GroupName, Pid).
+-spec local_member(Pid :: pid(), GroupName :: any()) -> boolean().
+local_member(Pid, GroupName) ->
+    syn_groups:local_member(Pid, GroupName).
 
 -spec groups_count() -> non_neg_integer().
 groups_count() ->
